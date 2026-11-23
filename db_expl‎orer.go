@@ -1,25 +1,25 @@
 package main
 
 import (
+	"context"
 	"database/sql"
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"sort"
 	"strconv"
 	"strings"
 )
 
-// columnInfo — метаданные одного поля таблицы.
 type columnInfo struct {
 	Name       string
-	DataType   string // "int" | "float" | "string"
+	DataType   string
 	IsNullable bool
 	IsPrimary  bool
 	HasDefault bool
 	IsAutoInc  bool
 }
 
-// tableInfo — метаданные таблицы.
 type tableInfo struct {
 	Name    string
 	Columns []columnInfo
@@ -27,20 +27,18 @@ type tableInfo struct {
 	PK      *columnInfo
 }
 
-// DBExplorer — вся логика в полях структуры (глобалов нет).
 type DBExplorer struct {
 	db      *sql.DB
 	tables  map[string]*tableInfo
 	ordered []string
 }
 
-// NewDBExplorer — точка входа, как в каркасе.
 func NewDBExplorer(db *sql.DB) (http.Handler, error) {
 	e := &DBExplorer{
 		db:     db,
 		tables: make(map[string]*tableInfo),
 	}
-	if err := e.loadSchema(); err != nil {
+	if err := e.loadSchema(context.Background()); err != nil {
 		return nil, err
 	}
 	mux := http.NewServeMux()
@@ -48,10 +46,16 @@ func NewDBExplorer(db *sql.DB) (http.Handler, error) {
 	return mux, nil
 }
 
-// ---------- Загрузка метаданных ----------
+// ---------- Загрузка метаданных (через одно соединение) ----------
 
-func (e *DBExplorer) loadSchema() error {
-	rows, err := e.db.Query("SHOW TABLES")
+func (e *DBExplorer) loadSchema(ctx context.Context) error {
+	conn, err := e.db.Conn(ctx)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	rows, err := conn.QueryContext(ctx, "SHOW TABLES")
 	if err != nil {
 		return err
 	}
@@ -69,11 +73,13 @@ func (e *DBExplorer) loadSchema() error {
 		rows.Close()
 		return err
 	}
-	// обязательно закрыть до следующих запросов — иначе OpenConnections > 1
 	rows.Close()
 
+	// тест ждёт алфавитный порядок: items, users
+	sort.Strings(names)
+
 	for _, name := range names {
-		ti, err := e.loadTable(name)
+		ti, err := e.loadTable(ctx, conn, name)
 		if err != nil {
 			return err
 		}
@@ -83,9 +89,9 @@ func (e *DBExplorer) loadSchema() error {
 	return nil
 }
 
-func (e *DBExplorer) loadTable(name string) (*tableInfo, error) {
+func (e *DBExplorer) loadTable(ctx context.Context, conn *sql.Conn, name string) (*tableInfo, error) {
 	safe := strings.ReplaceAll(name, "`", "``")
-	rows, err := e.db.Query("SHOW FULL COLUMNS FROM `" + safe + "`")
+	rows, err := conn.QueryContext(ctx, "SHOW FULL COLUMNS FROM `"+safe+"`")
 	if err != nil {
 		return nil, err
 	}
@@ -127,17 +133,12 @@ func (e *DBExplorer) loadTable(name string) (*tableInfo, error) {
 			}
 		}
 
-		var def interface{}
-		if i, ok := idx["default"]; ok {
-			def = vals[i]
-		}
-
 		ti.Columns = append(ti.Columns, columnInfo{
 			Name:       getStr("field"),
 			DataType:   simplifyType(strings.ToLower(getStr("type"))),
 			IsNullable: strings.EqualFold(getStr("null"), "YES"),
 			IsPrimary:  strings.EqualFold(getStr("key"), "PRI"),
-			HasDefault: def != nil,
+			HasDefault: vals[idx["default"]] != nil,
 			IsAutoInc:  strings.Contains(strings.ToLower(getStr("extra")), "auto_increment"),
 		})
 	}
@@ -145,7 +146,6 @@ func (e *DBExplorer) loadTable(name string) (*tableInfo, error) {
 		return nil, err
 	}
 
-	// указатели — после окончательного формирования среза
 	ti.ByName = make(map[string]*columnInfo, len(ti.Columns))
 	for i := range ti.Columns {
 		ti.ByName[ti.Columns[i].Name] = &ti.Columns[i]
@@ -177,7 +177,7 @@ func simplifyType(t string) string {
 	}
 }
 
-// ---------- Роутинг (руками) ----------
+// ---------- Роутинг ----------
 
 func (e *DBExplorer) route(w http.ResponseWriter, r *http.Request) {
 	path := strings.Trim(r.URL.Path, "/")
@@ -250,7 +250,9 @@ func (e *DBExplorer) handleList(w http.ResponseWriter, r *http.Request, ti *tabl
 		}
 	}
 
-	rows, err := e.db.Query("SELECT * FROM `"+ti.Name+"` LIMIT ? OFFSET ?", limit, offset)
+	// limit/offset — уже int, инъекция невозможна
+	query := fmt.Sprintf("SELECT * FROM `%s` LIMIT %d OFFSET %d", ti.Name, limit, offset)
+	rows, err := e.db.Query(query)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -316,7 +318,6 @@ func (e *DBExplorer) handleCreate(w http.ResponseWriter, r *http.Request, ti *ta
 		if !present {
 			continue
 		}
-		// auto_increment PK при вставке игнорируется
 		if col.IsPrimary && col.IsAutoInc {
 			continue
 		}
@@ -328,12 +329,12 @@ func (e *DBExplorer) handleCreate(w http.ResponseWriter, r *http.Request, ti *ta
 		values[col.Name] = v
 	}
 
-	// NOT NULL без дефолта и без значения — zero
+	// NOT NULL без auto_inc — всегда zero, если не пришло
 	for _, col := range ti.Columns {
 		if _, ok := values[col.Name]; ok {
 			continue
 		}
-		if !col.IsNullable && !col.HasDefault && !col.IsAutoInc {
+		if !col.IsNullable && !col.IsAutoInc {
 			values[col.Name] = zeroValue(col.DataType)
 		}
 	}
@@ -381,7 +382,6 @@ func (e *DBExplorer) handleUpdate(w http.ResponseWriter, r *http.Request, ti *ta
 		return
 	}
 
-	// PK нельзя обновлять
 	if ti.PK != nil {
 		if _, ok := body[ti.PK.Name]; ok {
 			writeError(w, http.StatusBadRequest,
